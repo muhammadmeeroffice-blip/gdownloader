@@ -1,5 +1,7 @@
 # Google Drive authentication cookies (private session tokens)
 cookies.txt
+*cookie*.txt
+*cookies*.txt
 
 # Local execution logs
 download_log.txt

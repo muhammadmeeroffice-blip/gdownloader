@@ -43,7 +43,32 @@ from gdown.exceptions import DownloadError, FileURLRetrievalError
 BASE_DIR = Path(__file__).parent.resolve()
 LINKS_FILE = BASE_DIR / "links.txt"
 OUTPUT_DIR = BASE_DIR / "Download Data"
-COOKIES_FILE = BASE_DIR / "cookies.txt"
+
+def find_all_cookie_files() -> List[Path]:
+    """Finds all .txt files in BASE_DIR that contain 'cookie' (case-insensitive) in their filename."""
+    files = [
+        f for f in BASE_DIR.glob("*.txt")
+        if "cookie" in f.name.lower() and f.is_file() and f.name.lower() != "download_log.txt"
+    ]
+    # Priority: exact 'cookies.txt' first, then sorted by most recently modified
+    files.sort(key=lambda f: (0 if f.name.lower() == "cookies.txt" else 1, -f.stat().st_mtime))
+    return files
+
+
+def find_cookies_file(custom_path: Optional[str] = None) -> Optional[Path]:
+    """
+    Finds a cookies file:
+    - If custom_path provided and exists, returns it
+    - Checks for exact 'cookies.txt' or any .txt file containing 'cookie' in its name
+    """
+    if custom_path:
+        p = Path(custom_path)
+        if p.is_file():
+            return p
+    candidates = find_all_cookie_files()
+    return candidates[0] if candidates else None
+
+COOKIES_FILE = find_cookies_file()
 RETRIES = 5
 FILE_RETRIES = 3
 QUIET = False
@@ -249,7 +274,7 @@ def download_single_file_resilient(
                 output=str(target_path),
                 quiet=True,
                 use_cookies=use_cookies,
-                cookies_file=str(COOKIES_FILE) if (use_cookies and COOKIES_FILE.exists()) else None,
+                cookies_file=str(COOKIES_FILE) if (use_cookies and COOKIES_FILE and COOKIES_FILE.exists()) else None,
                 user_agent=USER_AGENT,
             )
             if target_path.exists() and target_path.stat().st_size > 0:
@@ -281,7 +306,7 @@ def download_single_file_resilient(
             output=str(target_path),
             quiet=QUIET,
             use_cookies=use_cookies,
-            cookies_file=str(COOKIES_FILE) if (use_cookies and COOKIES_FILE.exists()) else None,
+            cookies_file=str(COOKIES_FILE) if (use_cookies and COOKIES_FILE and COOKIES_FILE.exists()) else None,
             user_agent=USER_AGENT,
         )
         if target_path.exists() and target_path.stat().st_size > 0:
@@ -433,9 +458,50 @@ def is_folder_complete(folder_path: Path) -> bool:
 
 
 def sanitize_filename(filename: str) -> str:
-    filename = filename.replace("\x00", "")
-    filename = filename.replace("/", "_").replace("\\", "_").strip()
-    return filename if filename not in ("", ".", "..") else "_"
+    r"""
+    Sanitizes a single filename or directory name component for Windows/POSIX:
+    - Removes ASCII control characters (\x00-\x1f)
+    - Replaces forbidden Windows characters (< > : " / \ | ? *) with '_'
+    - Strips leading and trailing spaces and dots (invalid on Windows)
+    - Guards against Windows reserved device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9)
+    """
+    if not filename:
+        return "_"
+    clean = re.sub(r"[\x00-\x1f]", "", str(filename))
+    clean = re.sub(r'[<>:"/\\|?*]', "_", clean)
+    clean = clean.strip(" .\t\r\n")
+    if not clean or clean in ("", ".", ".."):
+        return "_"
+    stem = clean.split(".")[0].upper()
+    reserved = {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}
+    if stem in reserved:
+        clean = f"_{clean}"
+    return clean
+
+
+def sanitize_rel_path(rel_path: str) -> Path:
+    """
+    Sanitizes each directory and file component in a relative path.
+    Preserves folder hierarchy while guaranteeing valid names on Windows.
+    """
+    p = Path(rel_path)
+    clean_parts = [sanitize_filename(part) for part in p.parts]
+    return Path(*clean_parts)
+
+
+# Monkeypatch gdown internal sanitization so that gdown's built-in routines
+# don't trigger WinError 123 on reserved characters (?, *, :, etc.)
+try:
+    import gdown.download
+    import gdown.download_folder
+    mod_dl = sys.modules.get(gdown.download.__module__)
+    mod_df = sys.modules.get(gdown.download_folder.__module__)
+    if mod_dl and hasattr(mod_dl, "_sanitize_filename"):
+        mod_dl._sanitize_filename = lambda *, filename: sanitize_filename(filename)
+    if mod_df and hasattr(mod_df, "_sanitize_filename"):
+        mod_df._sanitize_filename = lambda *, filename: sanitize_filename(filename)
+except Exception:
+    pass
 
 
 def find_existing_folder_for_title(title: str) -> Optional[Path]:
@@ -447,15 +513,17 @@ def find_existing_folder_for_title(title: str) -> Optional[Path]:
     if not OUTPUT_DIR.exists():
         return None
 
-    # 1. Exact direct matches
-    exact = OUTPUT_DIR / title
-    if exact.is_dir():
-        return exact
-
     sanitized = sanitize_filename(title)
     sanitized_dir = OUTPUT_DIR / sanitized
     if sanitized_dir.is_dir():
         return sanitized_dir
+
+    try:
+        exact = OUTPUT_DIR / title
+        if exact.is_dir():
+            return exact
+    except OSError:
+        pass
 
     title_lower = title.strip().lower()
     clean_title = re.sub(r"^(d\d+|part\s*\d+)\s*", "", title_lower, flags=re.IGNORECASE).strip()
@@ -480,6 +548,18 @@ def find_existing_folder_for_title(title: str) -> Optional[Path]:
             clean_item = re.sub(r"^(d\d+|part\s*\d+)\s*", "", item.name.strip().lower(), flags=re.IGNORECASE).strip()
             if sanitize_filename(clean_item) == clean_title_sanitized:
                 return item
+
+    # Pass 4: Normalized alphanumeric comparison
+    def norm(s: str) -> str:
+        s = re.sub(r"^(d\d+|part\s*\d+)\s*", "", s.strip().lower(), flags=re.IGNORECASE)
+        return re.sub(r"[\W_]+", "", s)
+
+    norm_target = norm(title)
+    if norm_target:
+        for item in OUTPUT_DIR.iterdir():
+            if item.is_dir() and not item.name.endswith("_FAILED"):
+                if norm(item.name) == norm_target:
+                    return item
 
     return None
 
@@ -556,7 +636,7 @@ def update_folder_incremental(url: str, index: int, total: int, use_cookies: boo
             skip_download=True,
             quiet=True,
             use_cookies=use_cookies,
-            cookies_file=str(COOKIES_FILE) if (use_cookies and COOKIES_FILE.exists()) else None,
+            cookies_file=str(COOKIES_FILE) if (use_cookies and COOKIES_FILE and COOKIES_FILE.exists()) else None,
             user_agent=USER_AGENT,
         )
     except Exception as e:
@@ -571,7 +651,7 @@ def update_folder_incremental(url: str, index: int, total: int, use_cookies: boo
     logger.info(f"[{index}/{total}] [UPDATE] Checking {len(remote_files)} files in '{matched_dir.name[:35]}'...")
 
     session = requests.Session()
-    if use_cookies and COOKIES_FILE.exists():
+    if use_cookies and COOKIES_FILE and COOKIES_FILE.exists():
         try:
             cj = http.cookiejar.MozillaCookieJar(str(COOKIES_FILE))
             cj.load()
@@ -587,12 +667,13 @@ def update_folder_incremental(url: str, index: int, total: int, use_cookies: boo
 
     def check_file(f):
         try:
+            rel_clean = sanitize_rel_path(f.path)
             if is_os_junk_file(f.path):
-                return f, matched_dir / f.path, "UP_TO_DATE", 0, None
+                return f, matched_dir / rel_clean, "UP_TO_DATE", 0, None
 
-            lp = matched_dir / f.path
+            lp = matched_dir / rel_clean
             if not lp.exists():
-                candidates = [p for p in matched_dir.rglob("*") if p.is_file() and p.name.lower() == Path(f.path).name.lower()]
+                candidates = [p for p in matched_dir.rglob("*") if p.is_file() and p.name.lower() == rel_clean.name.lower()]
                 if candidates:
                     lp = candidates[0]
                 else:
@@ -619,7 +700,7 @@ def update_folder_incremental(url: str, index: int, total: int, use_cookies: boo
             return f, lp, "UP_TO_DATE", r_size or l_size, r_mtime or l_mtime
         except Exception as err:
             logger.warning(f"Error inspecting {getattr(f, 'path', str(f))}: {err}")
-            return f, matched_dir / getattr(f, "path", str(f)), "CHECK_ERROR", None, None
+            return f, matched_dir / sanitize_rel_path(getattr(f, "path", "file")), "CHECK_ERROR", None, None
 
     results = []
     with ThreadPoolExecutor(max_workers=6) as executor:
@@ -631,7 +712,7 @@ def update_folder_incremental(url: str, index: int, total: int, use_cookies: boo
             except Exception as e:
                 f_item = future_to_f[future]
                 logger.warning(f"Error checking {getattr(f_item, 'path', 'file')}: {e}")
-                results.append((f_item, matched_dir / getattr(f_item, "path", "file"), "ERROR_FALLBACK", 0, None))
+                results.append((f_item, matched_dir / sanitize_rel_path(getattr(f_item, "path", "file")), "ERROR_FALLBACK", 0, None))
 
     for f, lp, status, r_size, r_mtime in results:
         if status != "UP_TO_DATE":
@@ -652,10 +733,11 @@ def update_folder_incremental(url: str, index: int, total: int, use_cookies: boo
         if "QUOTA_EXCEEDED" in reason:
             logger.warning(f"  [!] Skipped {f.path}: Google Drive download quota exceeded on remote file (try again later).")
             continue
-        logger.info(f"  -> Updating: {f.path} [{reason}]")
+        rel_clean = sanitize_rel_path(f.path)
+        logger.info(f"  -> Updating: {rel_clean} [{reason}]")
         ok, res_reason = download_single_file_resilient(
             file_id=f.id,
-            rel_path=f.path,
+            rel_path=str(rel_clean),
             target_path=lp,
             session=session,
             use_cookies=use_cookies,
@@ -722,7 +804,7 @@ def download_folder(url: str, index: int, total: int, use_cookies: bool, update_
                 skip_download=True,
                 quiet=True,
                 use_cookies=active_use_cookies,
-                cookies_file=str(COOKIES_FILE) if (active_use_cookies and COOKIES_FILE.exists()) else None,
+                cookies_file=str(COOKIES_FILE) if (active_use_cookies and COOKIES_FILE and COOKIES_FILE.exists()) else None,
                 user_agent=USER_AGENT,
             )
             if remote_files and len(remote_files) > 0:
@@ -740,7 +822,7 @@ def download_folder(url: str, index: int, total: int, use_cookies: bool, update_
         try:
             res = gdown.download_folder(
                 url=url,
-                output=output_path,
+                output=str(matched_dir),
                 quiet=QUIET,
                 use_cookies=False,
                 resume=True,
@@ -760,7 +842,7 @@ def download_folder(url: str, index: int, total: int, use_cookies: bool, update_
 
     session = requests.Session()
     session.headers["User-Agent"] = USER_AGENT
-    if active_use_cookies and COOKIES_FILE.exists():
+    if active_use_cookies and COOKIES_FILE and COOKIES_FILE.exists():
         try:
             cj = http.cookiejar.MozillaCookieJar(str(COOKIES_FILE))
             cj.load()
@@ -775,7 +857,8 @@ def download_folder(url: str, index: int, total: int, use_cookies: bool, update_
         if is_os_junk_file(f.path):
             continue
 
-        target_file = matched_dir / f.path
+        rel_clean = sanitize_rel_path(f.path)
+        target_file = matched_dir / rel_clean
         if target_file.exists():
             sz = target_file.stat().st_size
             is_vid = any(target_file.suffix.lower().endswith(x) for x in [".mp4", ".mov", ".mkv"])
@@ -785,7 +868,7 @@ def download_folder(url: str, index: int, total: int, use_cookies: bool, update_
 
         ok, reason = download_single_file_resilient(
             file_id=f.id,
-            rel_path=f.path,
+            rel_path=str(rel_clean),
             target_path=target_file,
             session=session,
             use_cookies=active_use_cookies,
@@ -794,13 +877,13 @@ def download_folder(url: str, index: int, total: int, use_cookies: bool, update_
         if ok:
             downloaded_files += 1
             if reason not in ["SKIPPED_JUNK", "QUOTA_EXCEEDED_PRESERVED_LOCAL"]:
-                logger.info(f"  + Downloaded: {f.path} [{reason}]")
+                logger.info(f"  + Downloaded: {rel_clean} [{reason}]")
         else:
             if "QUOTA_EXCEEDED" in reason:
-                quota_files.append(f.path)
-                logger.warning(f"  [!] Quota exceeded for {f.path} (Google temporary 24h limit).")
+                quota_files.append(str(rel_clean))
+                logger.warning(f"  [!] Quota exceeded for {rel_clean} (Google temporary 24h limit).")
             else:
-                logger.warning(f"  [!] Failed to download {f.path}: {reason}")
+                logger.warning(f"  [!] Failed to download {rel_clean}: {reason}")
 
     # Check completeness
     local_files = [p for p in matched_dir.rglob("*") if p.is_file() and not is_os_junk_file(p.name)]
@@ -887,9 +970,10 @@ def run_qc(sample_count: Optional[int] = None, start_idx: int = 1):
 
 
 def main():
-    global SKIP_EXISTING, WAIT_BETWEEN_DOWNLOADS, RETRIES, QUIET, UPDATE_MODE
+    global SKIP_EXISTING, WAIT_BETWEEN_DOWNLOADS, RETRIES, QUIET, UPDATE_MODE, COOKIES_FILE
 
     parser = argparse.ArgumentParser(description="Google Drive Folder Downloader & QC")
+    parser.add_argument("--cookies", type=str, default=None, help="Path to cookies file (default: auto-detects any *cookie*.txt in workspace)")
     parser.add_argument("--update", action="store_true", help="Incremental update mode: check for new or modified files in Drive folders and download ONLY changed/new files (skips unchanged files).")
     parser.add_argument("--qc", action="store_true", help="Run QC report on downloaded folders")
     parser.add_argument("--qc-count", type=int, default=None, help="Number of links to check in QC (default: all)")
@@ -931,17 +1015,29 @@ def main():
 
     # Validate cookies
     use_cookies = False
-    if COOKIES_FILE.exists():
-        logger.info(f"Evaluating {COOKIES_FILE.name}...")
+    detected_cookie_file = find_cookies_file(args.cookies)
+    if detected_cookie_file and detected_cookie_file.exists():
+        COOKIES_FILE = detected_cookie_file
+        logger.info(f"Detected cookie file: {COOKIES_FILE.name}")
         if validate_cookies_file(COOKIES_FILE):
             logger.info(f"Cookies in {COOKIES_FILE.name} are VALID. Authenticated mode enabled.")
             use_cookies = True
         else:
             logger.warning(f"[!] {COOKIES_FILE.name} contains expired/stale session cookies (triggers Google login redirect).")
-            logger.warning("[!] Bypassing cookies.txt and using direct public access mode.")
-            use_cookies = False
+            # If multiple cookie files exist, check if another candidate is valid
+            found_valid_alt = False
+            for alt in find_all_cookie_files():
+                if alt != COOKIES_FILE and validate_cookies_file(alt):
+                    logger.info(f"[+] Found alternative valid cookies in {alt.name}! Using {alt.name}.")
+                    COOKIES_FILE = alt
+                    use_cookies = True
+                    found_valid_alt = True
+                    break
+            if not found_valid_alt:
+                logger.warning(f"[!] Bypassing {COOKIES_FILE.name} and using direct public access mode.")
+                use_cookies = False
     else:
-        logger.info("No cookies.txt found. Using direct public access mode.")
+        logger.info("No cookie file (*cookie*.txt) found. Using direct public access mode.")
 
     if args.force_cookies:
         logger.warning("Forcing use_cookies=True as requested by CLI flag.")
